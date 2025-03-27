@@ -7,3 +7,6 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 trust-dns-proto = "0.23"
 clap = { version = "4", features = ["derive"] }
+prometheus = "0.13"
+tiny_http = "0.12"
+lazy_static = "1.4"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Start dnsd after wg0 is up
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/sys/class/net/wg0
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 5
+WorkingDirectory=/opt/dnsd
+ExecStart=/opt/dnsd/dnsd  --overrides /opt/dnsd/blocklist -bind 10.254.254.1:53  -f 1.1.1.1,8.8.8.8
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target

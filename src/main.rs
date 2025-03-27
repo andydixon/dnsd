@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate lazy_static;
+
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -5,6 +8,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
+    thread,
     os::unix::fs::OpenOptionsExt,
 };
 
@@ -17,6 +21,8 @@ use trust_dns_proto::{
     serialize::binary::{BinEncoder, BinEncodable, BinDecodable},
 };
 
+use prometheus::{Encoder, TextEncoder, CounterVec, register_counter_vec};
+use tiny_http::{Response,Header};
 use std::net::ToSocketAddrs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,6 +34,14 @@ enum IPAddr {
 
 type OverrideMap = HashMap<(Name, RecordType), IPAddr>;
 type SharedMap = Arc<RwLock<OverrideMap>>;
+
+lazy_static! {
+    static ref DNS_COUNTER: CounterVec = register_counter_vec!(
+        "dnsd_requests_total",
+        "Number of DNS queries handled",
+        &["ip", "domain", "type", "source", "dns"]
+    ).unwrap();
+}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -89,35 +103,27 @@ fn load_overrides(path: &str) -> OverrideMap {
             };
 
             let ip = match rtype {
-                RecordType::A => match parts[2].parse() {
-                    Ok(ip) => IPAddr::V4(ip),
-                    Err(_) => continue,
-                },
-                RecordType::AAAA => match parts[2].parse() {
-                    Ok(ip) => IPAddr::V6(ip),
-                    Err(_) => continue,
-                },
-                _ => continue,
+                RecordType::A => parts[2].parse().ok().map(IPAddr::V4),
+                RecordType::AAAA => parts[2].parse().ok().map(IPAddr::V6),
+                _ => None,
             };
 
-            map.insert((name, rtype), ip);
+            if let Some(ip) = ip {
+                map.insert((name, rtype), ip);
+            }
         }
     }
 
     map
 }
 
-// Try exact + wildcard match for requested type
-// If AAAA requested, fallback to A if available
 fn match_override(map: &OverrideMap, name: &Name, qtype: RecordType) -> Option<(IPAddr, RecordType)> {
     if let Some(ip) = lookup_override(map, name, qtype) {
         return Some((ip, qtype));
     }
 
-    if qtype == RecordType::AAAA {
-        if let Some(ip) = lookup_override(map, name, RecordType::A) {
-            return Some((ip, RecordType::A)); // fallback
-        }
+    if let Some(ip) = lookup_override(map, name, RecordType::A) {
+        return Some((ip, RecordType::A));
     }
 
     None
@@ -168,22 +174,39 @@ async fn main() -> std::io::Result<()> {
     let forwarders = Arc::new(args.forward);
     let socket = Arc::new(UdpSocket::bind(&args.bind).await?);
 
-    println!("Listening on {}", args.bind);
+    // Start metrics endpoint
+    thread::spawn(|| {
+        let server = tiny_http::Server::http("0.0.0.0:2112").unwrap();
+        println!("Metrics available on http://0.0.0.0:2112/metrics");
+
+        for req in server.incoming_requests() {
+            let encoder = TextEncoder::new();
+            let mf = prometheus::gather();
+            let mut buffer = Vec::new();
+            encoder.encode(&mf, &mut buffer).unwrap();
+
+            let response = Response::from_data(buffer)
+                .with_header("Content-Type: text/plain; version=0.0.4".parse::<Header>().unwrap());
+            let _ = req.respond(response);
+        }
+    });
+
+    println!("DNS server listening on {}", args.bind);
 
     loop {
         let mut buf = [0u8; 512];
         let (len, src) = socket.recv_from(&mut buf).await?;
         let req_data = buf[..len].to_vec();
 
-        handle_request(
-            req_data,
-            src,
-            overrides.clone(),
-            forwarders.clone(),
-            socket.clone(),
-            args.overrides.clone(),
-            args.debug,
-        ).await;
+        let overrides = overrides.clone();
+        let forwarders = forwarders.clone();
+        let socket = socket.clone();
+        let path = args.overrides.clone();
+        let debug = args.debug;
+
+        tokio::spawn(async move {
+            handle_request(req_data, src, overrides, forwarders, socket, path, debug).await;
+        });
     }
 }
 
@@ -205,11 +228,10 @@ async fn handle_request(
         resp.set_recursion_available(true);
         resp.add_queries(req.queries().to_vec());
 
-        // Hot reload support
         if req.queries().iter().any(|q| q.name().to_ascii() == "reload.dns.") {
             let mut map = overrides.write().await;
             *map = load_overrides(&path);
-            println!("Reloaded overrides.");
+            println!("Overrides reloaded.");
             resp.set_response_code(ResponseCode::NoError);
         } else {
             let map = overrides.read().await;
@@ -217,16 +239,15 @@ async fn handle_request(
 
             for query in req.queries() {
                 if debug {
-    println!(
-        "DEBUG: Received query [{}] for [{}] from {}",
-        query.query_type(),
-        query.name().to_ascii(),
-        src.ip()
-    );
-}
+                    println!(
+                        "DEBUG: Received query [{:?}] for [{}] from {}",
+                        query.query_type(),
+                        query.name().to_ascii(),
+                        src.ip()
+                    );
+                }
 
-             //   if let Some((ip, rtype)) = match_override(&map, query.name(), query.query_type()) {
-            if let Some((ip, rtype)) = match_override(&map, query.name(), query.query_type()).or_else(|| match_override(&map, query.name(), RecordType::A)) {
+                if let Some((ip, rtype)) = match_override(&map, query.name(), query.query_type()) {
                     let mut rec = Record::new();
                     rec.set_name(query.name().clone());
                     rec.set_record_type(rtype);
@@ -235,13 +256,21 @@ async fn handle_request(
                         IPAddr::V4(addr) => rec.set_data(Some(RData::A(A(addr)))),
                         IPAddr::V6(addr) => rec.set_data(Some(RData::AAAA(AAAA(addr)))),
                     };
-                    matched.push((query.name().to_ascii(), rec));
+                    matched.push((query.name().to_ascii(), rtype, rec));
                 }
             }
 
             if !matched.is_empty() {
-                for (domain, record) in matched {
-                    log_request(debug, src, &format!("{} ({:?})", domain, record.record_type()), "override");
+                for (domain, rtype, record) in matched {
+                    log_request(debug, src, &format!("{} ({:?})", domain, rtype), "override");
+                    DNS_COUNTER.with_label_values(&[
+                        &src.ip().to_string(),
+                        &domain,
+                        &format!("{:?}", rtype),
+                        "override",
+                        ""
+                    ]).inc();
+
                     resp.add_answer(record);
                 }
 
@@ -254,14 +283,24 @@ async fn handle_request(
             }
         }
 
-        // No override match → forward
+        // No match — forward
         if let Some((response, server)) = forward_query(&forwarders, &req_data).await {
-            log_request(debug, src, &req.queries()[0].name().to_ascii(), &server);
+            let q = &req.queries()[0];
+            log_request(debug, src, &q.name().to_ascii(), &server);
+
+            DNS_COUNTER.with_label_values(&[
+                &src.ip().to_string(),
+                &q.name().to_ascii(),
+                &format!("{:?}", q.query_type()),
+                "forward",
+                &server
+            ]).inc();
+
             let _ = socket.send_to(&response, src).await;
             return;
         }
 
-        // Forward failed → SERVFAIL
+        // Forward failed
         resp.set_response_code(ResponseCode::ServFail);
         let mut resp_buf = Vec::new();
         let mut encoder = BinEncoder::new(&mut resp_buf);
